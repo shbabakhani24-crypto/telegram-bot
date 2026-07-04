@@ -3,7 +3,7 @@ import pandas as pd
 
 from indicators import rsi, ichimoku
 
-exchange = ccxt.bybit({"options": {"defaultType": "spot"}})
+exchange = ccxt.okx({"options": {"defaultType": "spot"}})
 
 
 def get_symbols():
