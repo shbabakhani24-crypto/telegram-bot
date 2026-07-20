@@ -3,7 +3,7 @@ import pandas as pd
 
 from indicators import ichimoku
 
-exchange = ccxt.okx({"options": {"defaultType": "spot"}})
+exchange = ccxt.lbank({"options": {"defaultType": "spot"}})
 
 symbols = [
     "BTC/USDT",
