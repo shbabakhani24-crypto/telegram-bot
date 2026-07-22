@@ -55,23 +55,30 @@ symbols = [
     "WIF/USDT",
     "SAND/USDT",
     "JUP/USDT",
-    "BLUR/USDT"
+    "BLUR/USDT",
 ]
 
 
 def get_data(symbol, tf="4h"):
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=200)
-    df = pd.DataFrame(ohlcv, columns=["t", "o", "h", "l", "c", "v"])
-    return df
+    return pd.DataFrame(ohlcv, columns=["t", "o", "h", "l", "c", "v"])
 
 
-def prepare_ichimoku(df):
+def prepare_indicators(df):
     df = df.copy()
+
     tenkan, kijun, span_a, span_b = ichimoku(df)
     df["tenkan"] = tenkan
     df["kijun"] = kijun
     df["span_a"] = span_a
     df["span_b"] = span_b
+
+    ema_fast = df["c"].ewm(span=12, adjust=False).mean()
+    ema_slow = df["c"].ewm(span=26, adjust=False).mean()
+
+    df["macd"] = ema_fast - ema_slow
+    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+
     return df
 
 
@@ -82,109 +89,101 @@ def get_cloud_bounds(df):
     return cloud_top, cloud_bottom
 
 
-def get_h4_cross_strength(df_4h, direction):
-    recent = df_4h.tail(3).copy()
-    if recent.empty:
-        return 0
+def has_bearish_tenkan_kijun_cross(df):
+    recent = df.tail(3)
 
-    if direction == "LONG":
-        for i in range(1, len(recent)):
-            if recent["tenkan"].iloc[i] > recent["kijun"].iloc[i] and recent["tenkan"].iloc[i - 1] <= recent["kijun"].iloc[i - 1]:
-                return 30
-        if recent["tenkan"].iloc[-1] > recent["kijun"].iloc[-1]:
-            return 15
-        return 0
+    if len(recent) < 2:
+        return False
 
-    if direction == "SHORT":
-        for i in range(1, len(recent)):
-            if recent["tenkan"].iloc[i] < recent["kijun"].iloc[i] and recent["tenkan"].iloc[i - 1] >= recent["kijun"].iloc[i - 1]:
-                return 30
-        if recent["tenkan"].iloc[-1] < recent["kijun"].iloc[-1]:
-            return 15
-        return 0
+    for index in range(1, len(recent)):
+        previous_tenkan = recent["tenkan"].iloc[index - 1]
+        previous_kijun = recent["kijun"].iloc[index - 1]
+        current_tenkan = recent["tenkan"].iloc[index]
+        current_kijun = recent["kijun"].iloc[index]
 
-    return 0
+        if (
+            previous_tenkan >= previous_kijun
+            and current_tenkan < current_kijun
+        ):
+            return True
+
+    return False
 
 
-def get_future_cloud_score(df_4h, direction):
-    last = df_4h.iloc[-1]
-    if direction == "LONG":
-        return 20 if last["span_a"] > last["span_b"] else 0
-    if direction == "SHORT":
-        return 20 if last["span_a"] < last["span_b"] else 0
-    return 0
+def has_bearish_macd_cross(df):
+    recent = df.tail(3)
+
+    if len(recent) < 2:
+        return False
+
+    for index in range(1, len(recent)):
+        previous_macd = recent["macd"].iloc[index - 1]
+        previous_signal = recent["macd_signal"].iloc[index - 1]
+        current_macd = recent["macd"].iloc[index]
+        current_signal = recent["macd_signal"].iloc[index]
+
+        if previous_macd >= previous_signal and current_macd < current_signal:
+            return True
+
+    return False
 
 
-def get_chikou_score(df_4h, direction):
-    price = df_4h["c"].iloc[-1]
-    chikou_series = df_4h["c"].shift(26)
-    chikou_value = chikou_series.dropna().iloc[-1] if chikou_series.notna().any() else price
+def is_bearish_chikou_free(df):
+    if len(df) < 27:
+        return False
 
-    if direction == "LONG":
-        return 20 if chikou_value > price else -20
-    if direction == "SHORT":
-        return 20 if chikou_value < price else -20
-    return 0
+    current_price = df["c"].iloc[-1]
+    price_26_candles_ago_low = df["l"].iloc[-27]
+
+    return current_price < price_26_candles_ago_low
 
 
 def analyze_symbol(symbol):
-    df_4h = prepare_ichimoku(get_data(symbol, "4h"))
-    df_1d = prepare_ichimoku(get_data(symbol, "1d"))
+    df_4h = prepare_indicators(get_data(symbol, "4h"))
+    df_4h = df_4h.dropna().reset_index(drop=True)
 
-    last_d = df_1d.iloc[-1]
-    daily_cloud_top, daily_cloud_bottom = get_cloud_bounds(df_1d)
+    if len(df_4h) < 30:
+        raise ValueError("Not enough OHLCV data.")
 
-    if last_d["c"] > daily_cloud_top:
-        direction = "LONG"
-        trend_alignment = 30
-    elif last_d["c"] < daily_cloud_bottom:
-        direction = "SHORT"
-        trend_alignment = 30
-    else:
-        direction = "NONE"
-        trend_alignment = 0
+    last = df_4h.iloc[-1]
+    cloud_top, cloud_bottom = get_cloud_bounds(df_4h)
 
-    score = trend_alignment
-    cross_strength = get_h4_cross_strength(df_4h, direction)
-    future_cloud_score = get_future_cloud_score(df_4h, direction)
-    chikou_score = get_chikou_score(df_4h, direction)
+    price_below_cloud = last["c"] < cloud_bottom
+    tenkan_below_kijun = last["tenkan"] < last["kijun"]
+    bearish_tk_cross = has_bearish_tenkan_kijun_cross(df_4h)
+    bearish_macd_cross = has_bearish_macd_cross(df_4h)
+    chikou_free = is_bearish_chikou_free(df_4h)
 
-    score += cross_strength + future_cloud_score + chikou_score
+    score = 0
+    score += 25 if price_below_cloud else 0
+    score += 25 if bearish_tk_cross else 0
+    score += 25 if bearish_macd_cross else 0
+    score += 25 if chikou_free else 0
 
-    if direction == "LONG":
-        rules_ok = (
-            last_d["c"] > daily_cloud_top and
-            cross_strength >= 15 and
-            future_cloud_score == 20 and
-            chikou_score == 20
-        )
-    elif direction == "SHORT":
-        rules_ok = (
-            last_d["c"] < daily_cloud_bottom and
-            cross_strength >= 15 and
-            future_cloud_score == 20 and
-            chikou_score == 20
-        )
-    else:
-        rules_ok = False
+    rules_ok = (
+        price_below_cloud
+        and tenkan_below_kijun
+        and bearish_tk_cross
+        and bearish_macd_cross
+        and chikou_free
+    )
 
-    if score >= 80 and rules_ok:
-        signal = "LONG" if direction == "LONG" else "SHORT"
-    else:
-        signal = "NONE"
+    signal = "SHORT" if rules_ok else "NONE"
 
     return {
         "symbol": symbol,
-        "price": round(df_4h["c"].iloc[-1], 8),
-        "mode": direction,
+        "price": round(last["c"], 8),
         "signal": signal,
-        "score": round(score, 2),
-        "trend_alignment": trend_alignment,
-        "cross_strength": cross_strength,
-        "future_cloud_score": future_cloud_score,
-        "chikou_score": chikou_score,
-        "daily_cloud_top": round(daily_cloud_top, 8),
-        "daily_cloud_bottom": round(daily_cloud_bottom, 8),
+        "score": score,
+        "price_below_cloud": price_below_cloud,
+        "tenkan_below_kijun": tenkan_below_kijun,
+        "bearish_tk_cross": bearish_tk_cross,
+        "bearish_macd_cross": bearish_macd_cross,
+        "chikou_free": chikou_free,
+        "cloud_top": round(cloud_top, 8),
+        "cloud_bottom": round(cloud_bottom, 8),
+        "macd": round(last["macd"], 8),
+        "macd_signal": round(last["macd_signal"], 8),
     }
 
 
@@ -194,11 +193,9 @@ def scan():
 
     for sym in symbols:
         try:
-            result = analyze_symbol(sym)
-            results.append(result)
+            results.append(analyze_symbol(sym))
         except Exception as exc:
             errors.append(f"{sym}: {exc}")
-            continue
 
     if not results:
         if errors:
@@ -208,53 +205,53 @@ def scan():
             )
         return "❌ No setups found."
 
-    results.sort(key=lambda x: x["score"], reverse=True)
+    results.sort(key=lambda item: item["score"], reverse=True)
+    short_signals = [item for item in results if item["signal"] == "SHORT"]
 
-    long_signals = [r for r in results if r["signal"] == "LONG"]
-    short_signals = [r for r in results if r["signal"] == "SHORT"]
-
-    msg = "🎯 BIASED ICHIMOKU SCANNER\n"
+    msg = "🎯 BEARISH ICHIMOKU + MACD SCANNER (4H)\n"
     msg += "═" * 70 + "\n\n"
 
-    if long_signals:
-        msg += "🟢 LONG SIGNALS ✅\n"
-        msg += "─" * 70 + "\n\n"
-        for item in long_signals:
-            msg += (
-                f"⭐ {item['symbol']}\n"
-                f"  Score: {item['score']:.0f} | Mode: {item['mode']}\n"
-                f"  Trend: +30 | Cross: {item['cross_strength']} | Future Cloud: {item['future_cloud_score']} | Chikou: {item['chikou_score']}\n"
-            )
-            msg += "─" * 70 + "\n"
-        msg += "\n"
-
     if short_signals:
-        msg += "🔴 SHORT SIGNALS ❌\n"
+        msg += "🔴 SHORT SIGNALS\n"
         msg += "─" * 70 + "\n\n"
+
         for item in short_signals:
             msg += (
                 f"⭐ {item['symbol']}\n"
-                f"  Score: {item['score']:.0f} | Mode: {item['mode']}\n"
-                f"  Trend: +30 | Cross: {item['cross_strength']} | Future Cloud: {item['future_cloud_score']} | Chikou: {item['chikou_score']}\n"
+                f"  Price: {item['price']}\n"
+                f"  Score: {item['score']}/100\n"
+                f"  Below Cloud: {'YES' if item['price_below_cloud'] else 'NO'}\n"
+                f"  Tenkan < Kijun: {'YES' if item['tenkan_below_kijun'] else 'NO'}\n"
+                f"  Bearish TK Cross: {'YES' if item['bearish_tk_cross'] else 'NO'}\n"
+                f"  Bearish MACD Cross: {'YES' if item['bearish_macd_cross'] else 'NO'}\n"
+                f"  Chikou Free: {'YES' if item['chikou_free'] else 'NO'}\n"
             )
             msg += "─" * 70 + "\n"
-        msg += "\n"
 
-    if not long_signals and not short_signals:
-        msg += "🔔 NO SIGNALS MATCHING THE BIASED ICHIMOKU RULESET YET\n\n"
+        msg += "\n"
+    else:
+        msg += "🔔 NO SHORT SIGNALS MATCHING THE RULESET YET\n\n"
 
     msg += "📊 ALL COINS\n"
     msg += "─" * 70 + "\n\n"
 
     for item in results:
-        icon = "🟢" if item["signal"] == "LONG" else "🔴" if item["signal"] == "SHORT" else "⚪"
+        icon = "🔴" if item["signal"] == "SHORT" else "⚪"
+
         msg += (
-            f"{icon} {item['symbol']:<12}  "
-            f"Score: {item['score']:>5.0f}  "
+            f"{icon} {item['symbol']:<12} "
+            f"Score: {item['score']:>3}/100  "
             f"Signal: {item['signal']:<5}  "
-            f"Mode: {item['mode']:<5}\n"
+            f"Cloud: {'YES' if item['price_below_cloud'] else 'NO'}  "
+            f"TK: {'YES' if item['bearish_tk_cross'] else 'NO'}  "
+            f"MACD: {'YES' if item['bearish_macd_cross'] else 'NO'}  "
+            f"Chikou: {'YES' if item['chikou_free'] else 'NO'}\n"
         )
         msg += "─" * 70 + "\n"
+
+    if errors:
+        msg += "\n⚠️ Symbols with fetch errors:\n"
+        msg += "\n".join(errors[:5])
 
     return msg
 
